@@ -153,8 +153,14 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                                 backup_default_container,
                                                 enable_progress_timer,
                                                 db_driver)
+        self.swift_attempts = CONF.backup_swift_retry_attempts
+        self.swift_backoff = CONF.backup_swift_retry_backoff
+        self.backup_swift_auth_insecure = CONF.backup_swift_auth_insecure
+        self._connections = {}
+    
+    def get_connection(self, context):
         if CONF.backup_swift_url is None:
-            self.swift_url = None
+            swift_url = None
             info = CONF.swift_catalog_info
             try:
                 service_type, service_name, endpoint_type = info.split(':')
@@ -168,19 +174,20 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                     # It is assumed that service_types are unique within
                     # the service catalog, so once the correct one is found
                     # it is safe to break out of the loop
-                    self.swift_url = entry.get(
+                    swift_url = entry.get(
                         'endpoints')[0].get(endpoint_type)
                     break
         else:
-            self.swift_url = '%s%s' % (CONF.backup_swift_url,
+            swift_url = '%s%s' % (CONF.backup_swift_url,
                                        context.project_id)
-        if self.swift_url is None:
+        if swift_url is None:
             raise exception.BackupDriverException(_(
                 "Could not determine which Swift endpoint to use. This can "
                 "either be set in the service catalog or with the "
                 "cinder.conf config option 'backup_swift_url'."))
+        import pdb; pdb.set_trace()
         if CONF.backup_swift_auth_url is None:
-            self.auth_url = None
+            auth_url = None
             info = CONF.keystone_catalog_info
             try:
                 service_type, service_name, endpoint_type = info.split(':')
@@ -194,24 +201,23 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                     # It is assumed that service_types are unique within
                     # the service catalog, so once the correct one is found
                     # it is safe to break out of the loop
-                    self.auth_url = entry.get(
+                    auth_url = entry.get(
                         'endpoints')[0].get(endpoint_type)
                     break
         else:
-            self.auth_url = CONF.backup_swift_auth_url
+            auth_url = CONF.backup_swift_auth_url
 
-        if self.auth_url is None:
+        if auth_url is None:
             raise exception.BackupDriverException(_(
                 "Could not determine which Keystone endpoint to use. This can "
                 "either be set in the service catalog or with the "
                 "cinder.conf config option 'backup_swift_auth_url'."))
-        LOG.debug("Using swift URL %s", self.swift_url)
-        LOG.debug("Using auth URL %s", self.auth_url)
-        self.swift_attempts = CONF.backup_swift_retry_attempts
-        self.swift_backoff = CONF.backup_swift_retry_backoff
+        LOG.debug("Using swift URL %s", swift_url)
+        LOG.debug("Using auth URL %s", auth_url)
+
         LOG.debug('Connect to %s in "%s" mode', CONF.backup_swift_url,
                   CONF.backup_swift_auth)
-        self.backup_swift_auth_insecure = CONF.backup_swift_auth_insecure
+
         if CONF.backup_swift_auth == 'single_user':
             if CONF.backup_swift_user is None:
                 LOG.error("single_user auth mode enabled, "
@@ -227,8 +233,8 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 )
             if CONF.backup_swift_project is not None:
                 os_options['project_name'] = CONF.backup_swift_project
-            self.conn = swift.Connection(
-                authurl=self.auth_url,
+            return swift.Connection(
+                authurl=auth_url,
                 auth_version=CONF.backup_swift_auth_version,
                 tenant_name=CONF.backup_swift_tenant,
                 user=CONF.backup_swift_user,
@@ -239,9 +245,9 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 insecure=self.backup_swift_auth_insecure,
                 cacert=CONF.backup_swift_ca_cert_file)
         else:
-            self.conn = swift.Connection(retries=self.swift_attempts,
-                                         preauthurl=self.swift_url,
-                                         preauthtoken=self.context.auth_token,
+            return swift.Connection(retries=self.swift_attempts,
+                                         preauthurl=swift_url,
+                                         preauthtoken=context.auth_token,
                                          starting_backoff=self.swift_backoff,
                                          insecure=(
                                              self.backup_swift_auth_insecure),
@@ -303,45 +309,57 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 raise exception.SwiftConnectionFailed(reason=err)
             return body
 
-    def put_container(self, container):
+    def put_container(self, container, backup_id):
         """Create the container if needed. No failure if it pre-exists."""
+        conn = self.get_connector(backup_id)
+
         try:
-            self.conn.put_container(container)
+            conn.put_container(container)
         except socket.error as err:
             raise exception.SwiftConnectionFailed(reason=err)
         return
 
-    def get_container_entries(self, container, prefix):
+    def get_container_entries(self, container, prefix, backup_id):
         """Get container entry names"""
+        conn = self.get_connector(backup_id)
+
         try:
-            swift_objects = self.conn.get_container(container,
-                                                    prefix=prefix,
-                                                    full_listing=True)[1]
+            swift_objects = conn.get_container(container,
+                                               prefix=prefix,
+                                               full_listing=True)[1]
         except socket.error as err:
             raise exception.SwiftConnectionFailed(reason=err)
         swift_object_names = [swift_obj['name'] for swift_obj in swift_objects]
         return swift_object_names
 
-    def get_object_writer(self, container, object_name, extra_metadata=None):
+    def get_object_writer(self, container, object_name, extra_metadata=None,
+                          backup_id=None):
         """Return a writer object.
 
         Returns a writer object that stores a chunk of volume data in a
         Swift object store.
         """
-        return self.SwiftObjectWriter(container, object_name, self.conn)
+        conn = self.get_connector(backup_id)
 
-    def get_object_reader(self, container, object_name, extra_metadata=None):
+        return self.SwiftObjectWriter(container, object_name, conn)
+
+    def get_object_reader(self, container, object_name, extra_metadata=None,
+                          backup_id=None):
         """Return reader object.
 
         Returns a reader object that retrieves a chunk of backed-up volume data
         from a Swift object store.
         """
-        return self.SwiftObjectReader(container, object_name, self.conn)
+        conn = self.get_connector(backup_id)
 
-    def delete_object(self, container, object_name):
+        return self.SwiftObjectReader(container, object_name, conn)
+
+    def delete_object(self, container, object_name, backup_id):
         """Deletes a backup object from a Swift object store."""
+        conn = self.get_connector(backup_id)
+
         try:
-            self.conn.delete_object(container, object_name)
+            conn.delete_object(container, object_name)
         except socket.error as err:
             raise exception.SwiftConnectionFailed(reason=err)
 
@@ -362,6 +380,36 @@ class SwiftBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def get_extra_metadata(self, backup, volume):
         """Swift driver does not use any extra metadata."""
         return None
+
+    def delete_connector(self, backup_id):
+        del self._connections[backup_id]
+
+    def get_connector(self, backup_id):
+        if backup_id not in self._connections.keys():
+            raise Exception("here is get connector error")
+        return self._connections[backup_id]
+
+    def add_connector(self, context, backup_id):
+        # here we can check if the same connection is already create
+        # we can use it instead of creating the same for the second time
+        if backup_id in self._connections.keys():
+            raise Exception("here is an error")
+        self._connections[backup_id] = self.get_connection(context)
+
+    def check_for_setup_errors(self):
+        # Here we are trying to connect to swift backend service
+        # without any additional parameters.
+        # At the moment of execution we don't have any user data
+        # After just trying to do easiest operations, that will show
+        # that we've configured swift backup driver in right way
+        if not CONF.backup_swift_url:
+            raise Exception("Backup swift url wasn't found")                                 
+        conn = swift.Connection(retries=CONF.backup_swift_retry_attempts,
+                                preauthurl=CONF.backup_swift_url)
+        try:
+            conn.get_capabilities()
+        except Exception:
+            raise
 
 
 def get_backup_driver(context):

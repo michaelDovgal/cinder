@@ -109,17 +109,18 @@ class ChunkedBackupDriver(driver.BackupDriver):
     # abstract methods.
 
     @abc.abstractmethod
-    def put_container(self, container):
+    def put_container(self, container, backup_id):
         """Create the container if needed. No failure if it pre-exists."""
         return
 
     @abc.abstractmethod
-    def get_container_entries(self, container, prefix):
+    def get_container_entries(self, container, prefix, backup_id):
         """Get container entry names."""
         return
 
     @abc.abstractmethod
-    def get_object_writer(self, container, object_name, extra_metadata=None):
+    def get_object_writer(self, container, object_name, extra_metadata=None,
+                          backup_id=None):
         """Returns a writer object which stores the chunk data in backup repository.
 
            The object returned should be a context handler that can be used
@@ -128,12 +129,13 @@ class ChunkedBackupDriver(driver.BackupDriver):
         return
 
     @abc.abstractmethod
-    def get_object_reader(self, container, object_name, extra_metadata=None):
+    def get_object_reader(self, container, object_name, extra_metadata=None,
+                          backup_id=None):
         """Returns a reader object for the backed up chunk."""
         return
 
     @abc.abstractmethod
-    def delete_object(self, container, object_name):
+    def delete_object(self, container, object_name, backup_id=None):
         """Delete object from container."""
         return
 
@@ -182,12 +184,13 @@ class ChunkedBackupDriver(driver.BackupDriver):
                   {'container': backup.container, 'backup_id': backup.id})
 
         backup.save()
-        self.put_container(backup.container)
+        self.put_container(backup.container, backup.id)
         return backup.container
 
     def _generate_object_names(self, backup):
         prefix = backup['service_metadata']
-        object_names = self.get_container_entries(backup['container'], prefix)
+        object_names = self.get_container_entries(backup['container'], prefix,
+                                                  backup.id)
         LOG.debug('generated object list: %s.', object_names)
         return object_names
 
@@ -222,7 +225,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
         metadata_json = json.dumps(metadata, sort_keys=True, indent=2)
         if six.PY3:
             metadata_json = metadata_json.encode('utf-8')
-        with self.get_object_writer(container, filename) as writer:
+        with self.get_object_writer(container, filename, backup_id=backup['id']) as writer:
             writer.write(metadata_json)
         LOG.debug('_write_metadata finished. Metadata: %s.', metadata_json)
 
@@ -243,7 +246,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
         sha256file_json = json.dumps(sha256file, sort_keys=True, indent=2)
         if six.PY3:
             sha256file_json = sha256file_json.encode('utf-8')
-        with self.get_object_writer(container, filename) as writer:
+        with self.get_object_writer(container, filename, backup_id=backup['id']) as writer:
             writer.write(sha256file_json)
         LOG.debug('_write_sha256file finished.')
 
@@ -253,7 +256,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
         LOG.debug('_read_metadata started, container name: %(container)s, '
                   'metadata filename: %(filename)s.',
                   {'container': container, 'filename': filename})
-        with self.get_object_reader(container, filename) as reader:
+        with self.get_object_reader(container, filename, backup_id=backup['id']) as reader:
             metadata_json = reader.read()
         if six.PY3:
             metadata_json = metadata_json.decode('utf-8')
@@ -267,7 +270,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
         LOG.debug('_read_sha256file started, container name: %(container)s, '
                   'sha256 filename: %(filename)s.',
                   {'container': container, 'filename': filename})
-        with self.get_object_reader(container, filename) as reader:
+        with self.get_object_reader(container, filename, backup_id=backup['id']) as reader:
             sha256file_json = reader.read()
         if six.PY3:
             sha256file_json = sha256file_json.decode('utf-8')
@@ -328,7 +331,8 @@ class ChunkedBackupDriver(driver.BackupDriver):
         obj[object_name]['compression'] = algorithm
         LOG.debug('About to put_object')
         with self.get_object_writer(
-                container, object_name, extra_metadata=extra_metadata
+                container, object_name, extra_metadata=extra_metadata,
+                backup_id=backup['id']
         ) as writer:
             writer.write(output_data)
         md5 = hashlib.md5(data).hexdigest()
@@ -617,7 +621,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
 
             with self.get_object_reader(
                     container, object_name,
-                    extra_metadata=extra_metadata) as reader:
+                    extra_metadata=extra_metadata, backup_id=backup['id']) as reader:
                 body = reader.read()
             compression_algorithm = metadata_object[object_name]['compression']
             decompressor = self._get_compressor(compression_algorithm)
@@ -727,7 +731,7 @@ class ChunkedBackupDriver(driver.BackupDriver):
                             ' with delete.')
 
             for object_name in object_names:
-                self.delete_object(container, object_name)
+                self.delete_object(container, object_name, backup['id'])
                 LOG.debug('deleted object: %(object_name)s'
                           ' in container: %(container)s.',
                           {

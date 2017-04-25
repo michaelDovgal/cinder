@@ -410,6 +410,9 @@ class BackupDriver(base.Base):
         """
         return
 
+    def add_connector(self, context, backup_id):
+        return
+
 
 @six.add_metaclass(abc.ABCMeta)
 class BackupDriverWithVerify(BackupDriver):
